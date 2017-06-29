@@ -86,9 +86,12 @@ struct mroute4 {
 #endif
 
 struct mroute6 {
+	LIST_ENTRY(mroute6) link;
+
 	struct sockaddr_in6 source;
 	struct sockaddr_in6 group;      /* multicast group */
 	short   inbound;                /* incoming VIF    */
+	short   len;                    /* prefix len, or 0:disabled */
 	uint8_t ttl[MAX_MC_MIFS];       /* outgoing VIFs   */
 };
 
@@ -119,5 +122,8 @@ int  mroute_add_vif    (char *ifname, uint8_t mrdisc, uint8_t threshold);
 int  mroute_del_vif    (char *ifname);
 
 int  mroute_show       (int sd, int detail);
+
+void mroute_forward_thread (int forward_thread);
+void mroute_thread_init    (void);
 
 #endif /* SMCROUTE_MROUTE_H_ */

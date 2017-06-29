@@ -9,7 +9,8 @@ Requires=network-online.target
 
 [Service]
 Type=simple
-ExecStart=@SBINDIR@/smcrouted -n -s
+EnvironmentFile=/etc/default/smcroute
+ExecStart=@SBINDIR@/smcrouted -n -s $OPTS
 
 [Install]
 WantedBy=multi-user.target

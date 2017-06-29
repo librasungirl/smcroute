@@ -87,12 +87,19 @@ LIST_HEAD(, mroute4) mroute4_dyn_list = LIST_HEAD_INITIALIZER();
 LIST_HEAD(, mroute4) mroute4_static_list = LIST_HEAD_INITIALIZER();
 
 #ifdef HAVE_IPV6_MULTICAST_ROUTING
+LIST_HEAD(, mroute6) mroute6_conf_list = LIST_HEAD_INITIALIZER();
+LIST_HEAD(, mroute6) mroute6_dyn_list = LIST_HEAD_INITIALIZER();
 /*
  * Raw ICMPv6 socket used as interface for the IPv6 mrouted API.
  * Receives MLD packets and upcall messages from the kenrel.
  */
 static int mroute6_socket = -1;
 #endif
+
+static int s_forward_thread = 0;
+static int s_thread_mif = -1;
+static int s_backbone_mif = -1;
+static int s_backbone_threshold = -1;
 
 /* IPv4 internal virtual interfaces (VIF) descriptor vector */
 static struct {
@@ -830,6 +837,131 @@ static int proc_set_val(char *file, int val)
 #endif /* Linux only */
 
 /*
+ * Used for (*,G) matches
+ *
+ * The incoming candidate is compared to the configured rule, e.g.
+ * does 225.1.2.3 fall inside 225.0.0.0/8?  => Yes
+ * does 225.1.2.3 fall inside 225.0.0.0/15? => Yes
+ * does 225.1.2.3 fall inside 225.0.0.0/16? => No
+ */
+static int is_match6(struct mroute6 *rule, struct mroute6 *cand)
+{
+	int i, j;
+
+	if (rule->inbound != cand->inbound)
+		return 0;
+
+	if (rule->len == 0 && memcmp(rule->group.sin6_addr.s6_addr, cand->group.sin6_addr.s6_addr, sizeof(rule->group.sin6_addr)))
+	{
+		return 0;
+	}
+
+	i = rule->len / 8;
+	if (i > 0 &&
+		memcmp(rule->group.sin6_addr.s6_addr, cand->group.sin6_addr.s6_addr, i))
+	{
+		return 0;
+	}
+
+	j = rule->len % 8;
+	if (j > 0 &&
+		(rule->group.sin6_addr.s6_addr[i] >> (8 - j)) == (cand->group.sin6_addr.s6_addr[i] >> (8 - j))) {
+		return 0;
+	}
+
+	return 1;
+}
+
+/**
+ * mroute4_dyn_add - Add route to kernel if it matches a known (*,G) route.
+ * @route: Pointer to candidate struct mroute4 IPv4 multicast route
+ *
+ * Returns:
+ * POSIX OK(0) on success, non-zero on error with @errno set.
+ */
+int mroute6_dyn_add(struct mroute6 *route)
+{
+	struct mroute6 *entry, *new_entry;
+	int ret;
+
+	LIST_FOREACH(entry, &mroute6_conf_list, link) {
+		/* Find matching (*,G) ... and interface. */
+		if (!is_match6(entry, route))
+			continue;
+
+		/* Use configured template (*,G) outbound interfaces. */
+		memcpy(route->ttl, entry->ttl, NELEMS(route->ttl) * sizeof(route->ttl[0]));
+		break;
+	}
+
+	if (!entry) {
+		/*
+		 * No match, add entry without outbound interfaces
+		 * nevertheless to avoid continuous cache misses from
+		 * the kernel. Note that this still gets reported as an
+		 * error (ENOENT) below.
+		 */
+		smclog(LOG_DEBUG, "static route not found!");
+
+		if (!s_forward_thread) {
+			errno = ENOENT;
+			return -1;
+		}
+
+		if (s_thread_mif == -1 || s_backbone_mif == -1 || s_backbone_threshold == -1)
+		{
+			errno = ENOENT;
+			return -1;
+		}
+
+		if (route->inbound == s_thread_mif) {
+			smclog(LOG_INFO, "multicast from thread");
+			const char *outbound = getenv("OUTBOUND_FORWARDING");
+			if (!outbound || outbound[0] != '1') {
+				errno = EPERM;
+				return -1;
+			}
+
+#define GROUP_SCOPE(x) ((x).sin6_addr.s6_addr[1] & 0x0f)
+
+			int scope = GROUP_SCOPE(route->group);
+			if (scope == 4) {
+				const char *admin_local = getenv("ADMIN_LOCAL_FORWARDING");
+				if (!admin_local || admin_local[0] != '1') {
+					errno = EPERM;
+					return -1;
+				}
+			} else if (scope < 4) {
+				errno = EPERM;
+				return -1;
+			}
+
+			route->ttl[s_backbone_mif] = s_backbone_threshold;
+		} else if (route->inbound == s_backbone_mif) {
+			smclog(LOG_INFO, "multicast from backbone link");
+			errno = ENOENT;
+			return -1;
+		} else {
+			smclog(LOG_DEBUG, "not thread messages");
+			errno = ENOENT;
+			return -1;
+		}
+	}
+
+	/* Add to list of dynamically added routes. Necessary if the user
+	 * removes the (*,G) using the command line interface rather than
+	 * updating the conf file and SIGHUP. Note: if we fail to alloc()
+	 * memory we don't do anything, just add kernel route silently. */
+	new_entry = malloc(sizeof(struct mroute6));
+	if (new_entry) {
+		memcpy(new_entry, route, sizeof(struct mroute6));
+		LIST_INSERT_HEAD(&mroute6_dyn_list, new_entry, link);
+	}
+
+	ret = mroute6_add(route);
+	return ret;
+}
+/*
  * Receive and drop ICMPv6 stuff. This is either MLD packets or upcall
  * messages sent up from the kernel.
  *
@@ -844,6 +976,46 @@ static void handle_nocache6(int sd, void *arg)
 	result = read(sd, tmp, sizeof(tmp));
 	if (result < 0)
 		smclog(LOG_INFO, "Failed clearing MLD message from kernel: %s", strerror(errno));
+	struct mrt6msg *msg = (struct mrt6msg *)tmp;
+	if (msg->im6_msgtype == MRT6MSG_NOCACHE &&
+		IN6_IS_ADDR_MULTICAST(&msg->im6_dst)) {
+		struct mroute mrt;
+		struct mroute6 route;
+		struct iface *iface;
+		char origin[INET6_ADDRSTRLEN], group[INET6_ADDRSTRLEN];
+
+		memset(&route, 0, sizeof(route));
+
+		route.source.sin6_addr = msg->im6_src;
+		route.group.sin6_addr = msg->im6_dst;
+		route.inbound = msg->im6_mif;
+		inet_ntop(AF_INET6, &route.group.sin6_addr,  group,  INET6_ADDRSTRLEN);
+		inet_ntop(AF_INET6, &route.source.sin6_addr, origin, INET6_ADDRSTRLEN);
+		smclog(LOG_DEBUG, "New multicast data from %s to group %s on VIF %d", origin, group, route.inbound);
+
+		iface = iface_find_by_vif(route.inbound);
+		if (!iface) {
+			smclog(LOG_WARNING, "No matching interface for VIF %d, cannot add mroute.", route.inbound);
+			return;
+		}
+		result = mroute6_dyn_add(&route);
+		if (result) {
+			/*
+			 * This is a common error, the router receives streams it is not
+			 * set up to route -- we ignore these by default, but if the user
+			 * sets a more permissive log level we help out by showing what
+			 * is going on.
+			 */
+			if (ENOENT == errno)
+				smclog(LOG_INFO, "Multicast from %s, group %s, on %s does not match any (*,G) rule",
+				       origin, group, iface->name);
+			return;
+		}
+
+		mrt.version = 6;
+		mrt.u.mroute6 = route;
+		script_exec(&mrt);
+	}
 }
 #endif /* HAVE_IPV6_MULTICAST_ROUTING */
 
@@ -1047,6 +1219,18 @@ int mroute6_add(struct mroute6 *route)
 	if (mroute6_socket == -1)
 		return 0;
 
+	// TODO check exists
+	if (!memcmp(&route->source.sin6_addr, &in6addr_any, sizeof(in6addr_any))) {
+		struct mroute6 *entry;
+		smclog(LOG_DEBUG, "Add dynamic -> %s from MIF %d",
+				inet_ntop(AF_INET6, &route->group.sin6_addr, group, INET6_ADDRSTRLEN),
+				route->inbound);
+		entry = malloc(sizeof(struct mroute6));
+		memcpy(entry, route, sizeof(struct mroute6));
+		LIST_INSERT_HEAD(&mroute6_conf_list, entry, link);
+		return 0;
+	}
+
 	memset(&mc, 0, sizeof(mc));
 	mc.mf6cc_origin   = route->source;
 	mc.mf6cc_mcastgrp = route->group;
@@ -1070,17 +1254,7 @@ int mroute6_add(struct mroute6 *route)
 	return 0;
 }
 
-/**
- * mroute6_del - Remove route from kernel
- * @route: Pointer to struct mroute6 IPv6 multicast route to remove
- *
- * Removes the given multicast @route from the kernel multicast routing
- * table.
- *
- * Returns:
- * POSIX OK(0) on success, non-zero on error with @errno set.
- */
-int mroute6_del(struct mroute6 *route)
+static int kern_del6(struct mroute6 *route)
 {
 	char origin[INET6_ADDRSTRLEN], group[INET6_ADDRSTRLEN];
 	struct mf6cctl mc;
@@ -1093,7 +1267,7 @@ int mroute6_del(struct mroute6 *route)
 	mc.mf6cc_mcastgrp = route->group;
 	if (setsockopt(mroute6_socket, IPPROTO_IPV6, MRT6_DEL_MFC, (void *)&mc, sizeof(mc))) {
 		if (ENOENT == errno)
-			smclog(LOG_DEBUG, "failed removing multicast route, does not exist.");
+			smclog(LOG_DEBUG, "failed removing IPv6 multicast route, does not exist.");
 		else
 			smclog(LOG_DEBUG, "failed removing IPv6 multicast route: %s", strerror(errno));
 		return 1;
@@ -1102,6 +1276,48 @@ int mroute6_del(struct mroute6 *route)
 	smclog(LOG_DEBUG, "Del %s -> %s",
 	       inet_ntop(AF_INET6, &mc.mf6cc_origin.sin6_addr, origin, INET6_ADDRSTRLEN),
 	       inet_ntop(AF_INET6, &mc.mf6cc_mcastgrp.sin6_addr, group, INET6_ADDRSTRLEN));
+
+	return 0;
+}
+
+/**
+ * mroute6_del - Remove route from kernel
+ * @route: Pointer to struct mroute6 IPv6 multicast route to remove
+ *
+ * Removes the given multicast @route from the kernel multicast routing
+ * table.
+ *
+ * Returns:
+ * POSIX OK(0) on success, non-zero on error with @errno set.
+ */
+int mroute6_del(struct mroute6 *route)
+{
+	struct mroute6 *entry, *set, *tmp;
+
+	// TODO remote related dynamic rule
+	if (!memcmp(&route->source.sin6_addr, &in6addr_any, sizeof(in6addr_any))) {
+		/* Find matching (*,G) ... and interface .. and prefix length. */
+		LIST_FOREACH_SAFE(entry, &mroute6_conf_list, link, tmp) {
+			if (!is_match6(entry, route) || entry->len != route->len)
+				continue;
+
+			LIST_FOREACH_SAFE(set, &mroute6_dyn_list, link, tmp) {
+				if (!is_match6(entry, set) || entry->len != route->len)
+					continue;
+
+				kern_del6(set);
+				LIST_REMOVE(set, link);
+				free(set);
+			}
+
+			char group[INET6_ADDRSTRLEN];
+			smclog(LOG_DEBUG, "Del dynamic -> %s from MIF %d",
+					inet_ntop(AF_INET6, &entry->group.sin6_addr, group, INET6_ADDRSTRLEN),
+					entry->inbound);
+			LIST_REMOVE(entry, link);
+			free(entry);
+		}
+	}
 
 	return 0;
 }
@@ -1226,6 +1442,52 @@ int mroute_show(int sd, int detail)
 	return 0;
 }
 #endif
+
+void mroute_forward_thread(int forward_thread)
+{
+	struct mroute6 *r;
+	s_forward_thread = forward_thread;
+	if (forward_thread == 0)
+	{
+		LIST_FOREACH(r, &mroute6_dyn_list, link) {
+			if (r->inbound == s_thread_mif) {
+				kern_del6(r);
+			}
+		}
+	}
+}
+
+void mroute_thread_init(void)
+{
+	const char* forward_thread = getenv("FORWARD_THREAD");
+	if (forward_thread)
+	{
+		s_forward_thread = (forward_thread[0] == '1');
+		smclog(LOG_INFO, "forward thread %s", (s_forward_thread ? "yes" : "no"));
+	}
+
+	const char *backbone_ifname = getenv("BACKBONE_IFNAME");
+	const char *thread_ifname = getenv("THREAD_IFNAME");
+
+	if (backbone_ifname == NULL || thread_ifname == NULL) {
+		smclog(LOG_WARNING, "invalid ifname");
+		return;
+	}
+
+	struct ifmatch state_in;
+	struct iface *backbone_iface;
+	iface_match_init(&state_in);
+	s_thread_mif = iface_match_mif_by_name(thread_ifname, &state_in, NULL);
+	iface_match_init(&state_in);
+	s_backbone_mif = iface_match_mif_by_name(backbone_ifname, &state_in, &backbone_iface);
+	if (s_thread_mif == -1 || s_backbone_mif == -1) {
+		smclog(LOG_WARNING, "mif not found");
+		return;
+	}
+	smclog(LOG_INFO, "thread mif index is %d", s_thread_mif);
+	smclog(LOG_INFO, "backbone mif index is %d", s_backbone_mif);
+	s_backbone_threshold = backbone_iface->threshold;
+}
 
 /**
  * Local Variables:

@@ -231,6 +231,7 @@ static int do_mroute6(struct ipc_msg *msg)
 		struct mroute6 mroute;
 		struct ifmatch state_out;
 		char *ifname_in = msg->argv[pos++];
+		char *ptr;
 
 		mif = iface_match_mif_by_name(ifname_in, &state_in, NULL);
 		if (mif < 0)
@@ -243,7 +244,23 @@ static int do_mroute6(struct ipc_msg *msg)
 			return 1;
 		}
 
-		if (inet_pton(AF_INET6, msg->argv[pos++], &mroute.group.sin6_addr) <= 0 ||
+		char *group = msg->argv[pos++];
+		ptr = strchr(group, '/');
+		if (ptr) {
+			if (memcmp(&mroute.source.sin6_addr, &in6addr_any, sizeof(in6addr_any)))
+			{
+				smclog(LOG_WARNING, "GROUP/LEN not yet supported for source specific multicast.");
+				return 1;
+			}
+
+			mroute.len = atoi(ptr + 1);
+			if (mroute.len < 0 || mroute.len > 128) {
+				smclog(LOG_WARNING, "Invalid prefix length, %s/%d", group, mroute.len);
+				return 1;
+			}
+			*ptr = 0;
+		}
+		if (inet_pton(AF_INET6, group, &mroute.group.sin6_addr) <= 0 ||
 		    !IN6_IS_ADDR_MULTICAST(&mroute.group.sin6_addr)) {
 			smclog(LOG_DEBUG, "Invalid IPv6 group address");
 			return 1;
@@ -315,6 +332,18 @@ static int do_mroute(struct ipc_msg *msg)
 	return do_mroute4(msg);
 }
 
+static int do_forward_thread(struct ipc_msg *msg)
+{
+	if (msg->count < 1) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	mroute_forward_thread(msg->argv[0][0] == '1');
+
+	return 0;
+}
+
 static int do_mgroup(struct ipc_msg *msg)
 {
 	if (msg->count < 2) {
@@ -376,6 +405,10 @@ int msg_do(int sd, struct ipc_msg *msg)
 
 	case 's':
 		result = do_show(msg, sd, 0);
+		break;
+
+	case 'f':
+		result = do_forward_thread(msg);
 		break;
 
 	default:

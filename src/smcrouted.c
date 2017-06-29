@@ -195,6 +195,11 @@ static int start_server(void)
 		api--;
 	}
 
+	/*
+         * Init settings for thread.
+         */
+	mroute_thread_init();
+
 	/* At least one API (IPv4 or IPv6) must have initialized successfully
 	 * otherwise we abort the server initialization. */
 	if (!api) {

@@ -11,6 +11,9 @@ if HAVE_SYSTEMD
 systemd_DATA            = smcroute.service
 endif
 
+defaultdir = /etc/default
+default_DATA = smcroute
+
 ## Generate detached signature file (ascii-armored), like OpenVPN does
 GPG = gpg
 gpg-dist:

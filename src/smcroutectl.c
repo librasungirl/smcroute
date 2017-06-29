@@ -60,6 +60,8 @@ struct arg {
 	{ "del",     2, 'r', NULL,   NULL, NULL, 0 }, /* Alias */
 	{ "join",    2, 'j', NULL,   "Join multicast group on an interface", "eth0 225.1.2.3", 0 },
 	{ "leave",   2, 'l', NULL,   "Leave joined multicast group",         "eth0 225.1.2.3", 0 },
+	{ "inbound-forwarding",
+                              1, 'f', NULL,   "Whether forward inbound multicast packets for thread", "1", 0 },
 	{ NULL, 0, 0, NULL, NULL, NULL, 0 }
 };
 
@@ -319,6 +321,8 @@ static int usage(int code)
 	       "  join   IFNAME [SOURCE-IP] MULTICAST-GROUP\n"
 	       "  leave  IFNAME [SOURCE-IP] MULTICAST-GROUP\n"
 	       "\n"
+	       "  forward [on|off]\n"
+	       "\n"
 	       "  show   [groups|routes]\n"
 	       "\n"
 	       "Bug report address: %s\n", PACKAGE_BUGREPORT);
@@ -355,7 +359,7 @@ int main(int argc, char *argv[])
 	struct arg *cmd = NULL;
 
 	prognm = progname(argv[0]);
-	while ((c = getopt(argc, argv, "dhI:tv")) != EOF) {
+	while ((c = getopt(argc, argv, "dhI:tvp:")) != EOF) {
 		switch (c) {
 		case 'd':
 			detail++;
