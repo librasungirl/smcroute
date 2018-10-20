@@ -4,6 +4,7 @@ Documentation=man:smcroute
 Documentation=file:@DOCDIR@/README.md
 Documentation=https://github.com/troglobit/smcroute
 # ConditionPathExists=/etc/smcroute.conf
+After=wpantund.service
 After=network-online.target
 Requires=network-online.target
 
