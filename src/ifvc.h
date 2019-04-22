@@ -48,10 +48,13 @@ struct iface *iface_match_by_name     (const char *ifname, struct ifmatch *state
 int           ifname_is_wildcard      (const char *ifname);
 
 int           iface_get_vif           (struct iface *iface);
-int           iface_get_mif           (struct iface *iface);
-
 int           iface_match_vif_by_name (const char *ifname, struct ifmatch *state, struct iface **found);
+
+#ifdef HAVE_IPV6_MULTICAST_HOST
+struct iface *iface_find_by_mif       (int mif);
+int           iface_get_mif           (struct iface *iface);
 int           iface_match_mif_by_name (const char *ifname, struct ifmatch *state, struct iface **found);
+#endif
 
 
 static inline int is_anyaddr(inet_addr_t *ss)

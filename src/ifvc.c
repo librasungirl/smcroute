@@ -267,6 +267,28 @@ struct iface *iface_find_by_vif(int vif)
 }
 
 /**
+ * iface_find_by_mif - Find by virtual interface index
+ * @mif: Virtual IPv6 multicast interface index
+ *
+ * Returns:
+ * Pointer to a @struct iface of the requested interface, or %NULL if no
+ * interface matching @mif exists.
+ */
+struct iface *iface_find_by_mif(int mif)
+{
+	size_t i;
+
+	for (i = 0; i < num_ifaces; i++) {
+		struct iface *iface = &iface_list[i];
+
+		if (iface->mif >= 0 && iface->mif == mif)
+			return iface;
+	}
+
+	return NULL;
+}
+
+/**
  * iface_match_init - Initialize interface matching iterator
  * @state: Iterator state to be initialized
  */
