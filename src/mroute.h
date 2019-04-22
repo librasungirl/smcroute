@@ -116,8 +116,10 @@ void mroute4_dyn_expire(int max_idle);
 int  mroute4_add       (struct mroute4 *mroute);
 int  mroute4_del       (struct mroute4 *mroute);
 
-int  mroute6_enable    (int do_vifs, int table_id);
+int  mroute6_enable    (int do_mifs, int table_id, int timeout);
 void mroute6_disable   (int close_socket);
+int  mroute6_dyn_add   (struct mroute6 *mroute);
+void mroute6_dyn_expire(int max_idle);
 int  mroute6_add       (struct mroute6 *mroute);
 int  mroute6_del       (struct mroute6 *mroute);
 

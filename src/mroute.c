@@ -63,6 +63,11 @@
  */
 static int cache_timeout = 0;
 
+
+/*
+ * Indicates whether or not the timer is running.
+ */
+static int running = 0;
 /*
  * Raw IGMP socket used as interface for the IPv4 mrouted API.
  * Receives IGMP packets and upcall messages from the kernel.
@@ -86,14 +91,6 @@ LIST_HEAD(, mroute4) mroute4_dyn_list = LIST_HEAD_INITIALIZER();
  */
 LIST_HEAD(, mroute4) mroute4_static_list = LIST_HEAD_INITIALIZER();
 
-#ifdef HAVE_IPV6_MULTICAST_ROUTING
-/*
- * Raw ICMPv6 socket used as interface for the IPv6 mrouted API.
- * Receives MLD packets and upcall messages from the kenrel.
- */
-static int mroute6_socket = -1;
-#endif
-
 /* IPv4 internal virtual interfaces (VIF) descriptor vector */
 static struct {
 	struct iface *iface;
@@ -102,6 +99,29 @@ static struct {
 static int mroute4_add_vif(struct iface *iface);
 
 #ifdef HAVE_IPV6_MULTICAST_ROUTING
+/*
+ * Raw ICMPv6 socket used as interface for the IPv6 mrouted API.
+ * Receives MLD packets and upcall messages from the kenrel.
+ */
+static int mroute6_socket = -1;
+
+/*
+ * User added/configured (*,G) matched on-demand at runtime.  See
+ * mroute6_dyn_list for the (S,G) routes set from this "template".
+ */
+LIST_HEAD(, mroute6) mroute6_conf_list = LIST_HEAD_INITIALIZER();
+
+/*
+ * Dynamically, on-demand, set (S,G) routes.  Tracks if the user
+ * removes a configured (*,G) route.
+ */
+LIST_HEAD(, mroute6) mroute6_dyn_list = LIST_HEAD_INITIALIZER();
+
+/*
+ * Tracks regular static routes, mostly for 'smcroutectl show'
+ */
+LIST_HEAD(, mroute6) mroute6_static_list = LIST_HEAD_INITIALIZER();
+
 /* IPv6 internal virtual interfaces (VIF) descriptor vector */
 static struct mif {
 	struct iface *iface;
@@ -179,6 +199,11 @@ static void cache_flush(void *arg)
 
 	smclog(LOG_INFO, "Cache timeout, flushing unused (*,G) routes!");
 	mroute4_dyn_expire(cache_timeout);
+
+#ifdef HAVE_IPV6_MULTICAST_ROUTING
+	mroute6_dyn_expire(cache_timeout);
+#endif
+
 }
 
 /**
@@ -194,7 +219,6 @@ int mroute4_enable(int do_vifs, int table_id, int timeout)
 {
 	int arg = 1;
 	struct iface *iface;
-	static int running = 0;
 
 	if (mroute4_socket < 0) {
 		mroute4_socket = socket_create(AF_INET, SOCK_RAW, IPPROTO_IGMP, handle_nocache4, NULL);
@@ -888,6 +912,17 @@ static int proc_set_val(char *file, int val)
 }
 #endif /* Linux only */
 
+int  mroute6_dyn_add(struct mroute6 *mroute)
+{
+	(void)(mroute);
+	return 0;
+}
+
+void mroute6_dyn_expire(int max_idle)
+{
+	(void)(max_idle);
+}
+
 /*
  * Receive and drop ICMPv6 stuff. This is either MLD packets or upcall
  * messages sent up from the kernel.
@@ -915,7 +950,7 @@ static void handle_nocache6(int sd, void *arg)
  * Returns:
  * POSIX OK(0) on success, non-zero on error with @errno set.
  */
-int mroute6_enable(int do_vifs, int table_id)
+int mroute6_enable(int do_mifs, int table_id, int timeout)
 {
 #ifndef HAVE_IPV6_MULTICAST_ROUTING
 	(void)do_vifs;
@@ -979,9 +1014,15 @@ int mroute6_enable(int do_vifs, int table_id)
 	}
 #endif
 	/* Create virtual interfaces, IPv6 MIFs, for all IFF_MULTICAST interfaces */
-	if (do_vifs) {
+	if (do_mifs) {
 		for (iface = iface_iterator(1); iface; iface = iface_iterator(0))
 			mroute6_add_mif(iface);
+	}
+
+	if (timeout && !running) {
+		running++;
+		cache_timeout = timeout;
+		timer_add(timeout, cache_flush, NULL);
 	}
 
 	return 0;
